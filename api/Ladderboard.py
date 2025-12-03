@@ -1,6 +1,6 @@
 import gpiozero
-from LadderboardButton import LadderboardButton
-from LadderboardLed import LadderboardLed
+from api.LadderboardButton import LadderboardButton
+from api.LadderboardLed import LadderboardLed
 
 
 class Ladderboard:
@@ -40,6 +40,7 @@ class Ladderboard:
         for led in self.leds:
             if color == "ALL" or led.get_color() == color:
                 led.off()
+
     def leds_toggle(self, color="ALL"):
         for led in self.leds:
             if color == "ALL" or led.get_color() == color:
