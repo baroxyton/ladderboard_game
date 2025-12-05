@@ -4,4 +4,4 @@ NUM_IPS = 20
 PORT = "9090"
 
 class Peer:
-
+    pass
