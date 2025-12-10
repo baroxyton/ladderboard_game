@@ -10,7 +10,7 @@ async def main():
     mp.on("all_peers_connected", lambda: print("All peers connected!"))
     
     await mp.start_server()
-    await mp.seek_peers(2)  # Seek 2 peers
+    await mp.seek_peers(1)
     mp.emit("message", {"text": "Hello everyone!"})  # Send to all peers
     
     # Keep the server running
