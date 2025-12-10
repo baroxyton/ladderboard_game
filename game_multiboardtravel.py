@@ -94,6 +94,7 @@ class Game:
         self.players = {}  # player_id -> Player
         self.local_player = None  # Reference to this Pi's player
         self.running = False
+        self._loop = None  # Store event loop reference for thread-safe callbacks
         
         # Create local player
         self.local_player = Player(self.mp.peer_id)
@@ -204,13 +205,17 @@ class Game:
         self.render()
     
     def _broadcast_state(self):
-        """Broadcast current game state to all peers."""
+        """Broadcast current game state to all peers (thread-safe)."""
         state = {
             "player_id": self.local_player.player_id,
             "position": self.local_player.position,
             "world_leds": list(self.world.lit_leds)
         }
-        self.mp.emit("game_state", state)
+        # Schedule the async emit on the event loop (thread-safe for button callbacks)
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self.mp._emit_to_all("game_state", state))
+            )
     
     def render(self):
         """
@@ -235,6 +240,9 @@ class Game:
     async def start(self):
         """Start the game - connect to peers and begin game loop."""
         self.running = True
+        
+        # Store the event loop reference for thread-safe button callbacks
+        self._loop = asyncio.get_running_loop()
         
         # Start multiplayer server
         await self.mp.start_server()
