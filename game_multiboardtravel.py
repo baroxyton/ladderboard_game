@@ -123,22 +123,23 @@ class Game:
         button = self.board.buttons[button_index]
         
         # Create action handlers
+        # Using default arguments to properly capture values in closures
         if action == "toggle_led":
-            def handler():
+            def handler(self=self):
                 self.world.toggle_led(self.local_player.position)
                 self._broadcast_state()
                 self.render()
             button.on_press(handler)
             
         elif action == "move_left":
-            def handler():
+            def handler(self=self):
                 self.local_player.move_left()
                 self._broadcast_state()
                 self.render()
             button.on_press(handler)
             
         elif action == "move_right":
-            def handler():
+            def handler(self=self):
                 self.local_player.move_right()
                 self._broadcast_state()
                 self.render()

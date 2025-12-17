@@ -7,7 +7,8 @@ class LadderboardButton:
         self._is_pressed = False
         self._up_events = []
         self._down_events = []
-        self._button = Button(self._pin)
+        # Add bounce_time to debounce the button (prevents multiple triggers)
+        self._button = Button(self._pin, bounce_time=0.05)
         self._button.when_pressed = self._on_down
         self._button.when_released = self._on_up
 
