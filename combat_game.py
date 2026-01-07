@@ -46,6 +46,9 @@ COUNTDOWN_SECONDS = 3
 # Time to wait before restart after game over
 RESTART_DELAY_SECONDS = 5
 
+# Attack cooldown in seconds (prevents spam-clicking)
+ATTACK_COOLDOWN = 0.5
+
 
 # ============================================
 # GAME CLASSES
@@ -100,6 +103,7 @@ class Game:
         self.running = False
         self.game_over = False
         self._loop = None  # Store event loop reference for thread-safe callbacks
+        self._last_attack_time = 0  # Track last attack time for cooldown
 
         # Create local player (position will be set when peer connects)
         self.local_player = Player(self.mp.peer_id, position=0)
@@ -164,13 +168,21 @@ class Game:
         Attack in a direction (-1 for left, +1 for right).
         If opponent is on the adjacent cell, deal damage.
         """
+        import time
+        
         if self.remote_player is None:
             return
 
+        # Check cooldown
+        current_time = time.time()
+        if current_time - self._last_attack_time < ATTACK_COOLDOWN:
+            return  # Still on cooldown
+        
         target_position = (self.local_player.position + direction) % WORLD_SIZE
 
         if self.remote_player.position == target_position:
             # Hit the opponent!
+            self._last_attack_time = current_time  # Update cooldown timer
             self._broadcast_attack(target_position)
             # Blink green status LED (dealt damage)
             self._schedule_blink(STATUS_OK_LED)
@@ -387,6 +399,8 @@ class Game:
             self.remote_player.health = INITIAL_HEALTH
         # Re-assign spawn positions (deterministic based on peer_id)
         self._assign_spawn_positions()
+        # Reset attack cooldown
+        self._last_attack_time = 0
         self.board.leds_off("ALL")
 
     async def start(self):
