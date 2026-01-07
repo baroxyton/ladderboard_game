@@ -8,7 +8,7 @@ from api.Multiplayer import Multiplayer
 # ============================================
 
 # Game identifier for multiplayer matchmaking
-GAME_NAME = "multiboard_travel"
+GAME_NAME = "combat_game"
 
 # Number of players to wait for
 NUM_PLAYERS = 2
@@ -16,15 +16,26 @@ NUM_PLAYERS = 2
 # Number of normal LEDs in the "world" (excluding status LEDs)
 WORLD_SIZE = 8
 
-# Button action mappings - assign any action to any button (0-3)
-# Available actions: "toggle_led", "move_left", "move_right"
-# You can add more actions in the future and map them here
+# Player health settings
+INITIAL_HEALTH = 5
+
+# Button action mappings
+# Button 0 (leftmost): attack left
+# Button 1 (center-left): move left
+# Button 2 (center-right): move right
+# Button 3 (rightmost): attack right
 BUTTON_ACTIONS = {
-    0: "toggle_led",  # Button 0 toggles the LED at character position
-    1: "move_left",  # Button 1 moves character left
-    2: "move_right",  # Button 2 moves character right
-    3: None,  # Button 3 not assigned (available for future actions)
+    0: "attack_left",
+    1: "move_left",
+    2: "move_right",
+    3: "attack_right",
 }
+
+# LED indices for status and victory/defeat animations
+STATUS_OK_LED = 8      # Green status LED
+STATUS_FAIL_LED = 9    # Red status LED
+GREEN_LEDS = [4, 5]    # Main green LEDs for winner
+RED_LEDS = [0, 1]      # Main red LEDs for loser
 
 
 # ============================================
@@ -40,6 +51,7 @@ class Player:
         self.position = (
             position if position is not None else random.randint(0, WORLD_SIZE - 1)
         )
+        self.health = INITIAL_HEALTH
 
     def move_left(self):
         """Move the character one LED to the left (wraps around)."""
@@ -49,36 +61,18 @@ class Player:
         """Move the character one LED to the right (wraps around)."""
         self.position = (self.position + 1) % WORLD_SIZE
 
+    def take_damage(self):
+        """Reduce health by 1."""
+        self.health = max(0, self.health - 1)
 
-class GameWorld:
-    """
-    Represents the shared game world.
-    The world is a set of LEDs that can be toggled on/off independently of player positions.
-    """
-
-    def __init__(self):
-        # Track which LEDs in the world are "permanently" on (toggled by players)
-        self.lit_leds = set()
-
-    def toggle_led(self, position: int):
-        """Toggle an LED in the world on/off."""
-        if position in self.lit_leds:
-            self.lit_leds.remove(position)
-        else:
-            self.lit_leds.add(position)
-
-    def set_state(self, lit_leds: list):
-        """Set the world state from a list of lit LED positions."""
-        self.lit_leds = set(lit_leds)
-
-    def is_led_on(self, position: int) -> bool:
-        """Check if an LED at a position is lit in the world."""
-        return position in self.lit_leds
+    def is_alive(self) -> bool:
+        """Check if player is still alive."""
+        return self.health > 0
 
 
 class Game:
     """
-    Main game controller that manages players, the world, and rendering.
+    Main game controller for the combat game.
     Each Raspberry Pi runs one instance with its own ladderboard.
     Game state is synchronized via the Multiplayer networking API.
     """
@@ -93,13 +87,14 @@ class Game:
         """
         self.board = board
         self.mp = multiplayer
-        self.world = GameWorld()
         self.players = {}  # player_id -> Player
         self.local_player = None  # Reference to this Pi's player
+        self.remote_player = None  # Reference to the opponent
         self.running = False
+        self.game_over = False
         self._loop = None  # Store event loop reference for thread-safe callbacks
 
-        # Create local player
+        # Create local player with random starting position
         self.local_player = Player(self.mp.peer_id)
         self.players[self.mp.peer_id] = self.local_player
 
@@ -125,47 +120,96 @@ class Game:
         """
         button = self.board.buttons[button_index]
 
-        # Create action handlers
-        # Using default arguments to properly capture values in closures
-        if action == "toggle_led":
-
+        if action == "move_left":
             def handler(self=self):
-                self.world.toggle_led(self.local_player.position)
-                self._broadcast_state()
-                self.render()
-
-            button.on_press(handler)
-
-        elif action == "move_left":
-
-            def handler(self=self):
+                if self.game_over:
+                    return
                 self.local_player.move_left()
                 self._broadcast_state()
                 self.render()
-
             button.on_press(handler)
 
         elif action == "move_right":
-
             def handler(self=self):
+                if self.game_over:
+                    return
                 self.local_player.move_right()
                 self._broadcast_state()
                 self.render()
-
             button.on_press(handler)
 
-        # Add more actions here in the future:
-        # elif action == "some_new_action":
-        #     def handler():
-        #         # new action logic
-        #         self._broadcast_state()
-        #         self.render()
-        #     button.on_press(handler)
+        elif action == "attack_left":
+            def handler(self=self):
+                if self.game_over:
+                    return
+                self._attack_direction(-1)
+            button.on_press(handler)
+
+        elif action == "attack_right":
+            def handler(self=self):
+                if self.game_over:
+                    return
+                self._attack_direction(1)
+            button.on_press(handler)
+
+    def _attack_direction(self, direction: int):
+        """
+        Attack in a direction (-1 for left, +1 for right).
+        If opponent is on the adjacent cell, deal damage.
+        """
+        if self.remote_player is None:
+            return
+
+        target_position = (self.local_player.position + direction) % WORLD_SIZE
+
+        if self.remote_player.position == target_position:
+            # Hit the opponent!
+            self._broadcast_attack(target_position)
+            # Blink green status LED (dealt damage)
+            self._schedule_blink(STATUS_OK_LED)
+
+    def _schedule_blink(self, led_index: int):
+        """Schedule an LED blink on the event loop."""
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self._blink_led(led_index))
+            )
+
+    async def _blink_led(self, led_index: int):
+        """Blink a single LED once."""
+        self.board.leds[led_index].on()
+        await asyncio.sleep(0.2)
+        self.board.leds[led_index].off()
+
+    async def _victory_animation(self):
+        """Play victory animation - alternating green LEDs."""
+        for _ in range(5):
+            self.board.leds[GREEN_LEDS[0]].on()
+            self.board.leds[GREEN_LEDS[1]].off()
+            await asyncio.sleep(0.3)
+            self.board.leds[GREEN_LEDS[0]].off()
+            self.board.leds[GREEN_LEDS[1]].on()
+            await asyncio.sleep(0.3)
+        self.board.leds[GREEN_LEDS[1]].off()
+
+    async def _defeat_animation(self):
+        """Play defeat animation - alternating red LEDs."""
+        for _ in range(5):
+            self.board.leds[RED_LEDS[0]].on()
+            self.board.leds[RED_LEDS[1]].off()
+            await asyncio.sleep(0.3)
+            self.board.leds[RED_LEDS[0]].off()
+            self.board.leds[RED_LEDS[1]].on()
+            await asyncio.sleep(0.3)
+        self.board.leds[RED_LEDS[1]].off()
 
     def _setup_network_handlers(self):
         """Setup handlers for network events."""
         # Handle game state updates from other players
         self.mp.on("game_state", self._on_game_state)
+
+        # Handle attack events
+        self.mp.on("attack", self._on_attack)
 
         # Handle new peer connections
         self.mp.on("peer_connected", self._on_peer_connected)
@@ -178,22 +222,55 @@ class Game:
 
     def _on_game_state(self, peer, data: dict):
         """Handle incoming game state from another player."""
-        # Update remote player position
         player_id = data.get("player_id")
         position = data.get("position")
-        world_leds = data.get("world_leds", [])
+        health = data.get("health", INITIAL_HEALTH)
 
         if player_id and player_id != self.mp.peer_id:
             if player_id not in self.players:
                 self.players[player_id] = Player(player_id, position)
+                self.players[player_id].health = health
+                self.remote_player = self.players[player_id]
             else:
                 self.players[player_id].position = position
-
-        # Update world state
-        self.world.set_state(world_leds)
+                self.players[player_id].health = health
 
         # Re-render with updated state
         self.render()
+
+    def _on_attack(self, peer, data: dict):
+        """Handle incoming attack from opponent."""
+        target_position = data.get("target_position")
+        
+        # Check if we're at the target position
+        if self.local_player.position == target_position:
+            self.local_player.take_damage()
+            # Blink red status LED (took damage)
+            self._schedule_blink(STATUS_FAIL_LED)
+            
+            # Broadcast updated state
+            self._broadcast_state()
+            
+            # Check if game over
+            if not self.local_player.is_alive():
+                self._handle_game_over(winner=False)
+        
+        self.render()
+
+    def _handle_game_over(self, winner: bool):
+        """Handle end of game."""
+        self.game_over = True
+        self.board.leds_off("ALL")
+        
+        if self._loop is not None:
+            if winner:
+                self._loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._victory_animation())
+                )
+            else:
+                self._loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._defeat_animation())
+                )
 
     def _on_peer_connected(self, peer):
         """Handle a new peer connecting."""
@@ -206,6 +283,8 @@ class Game:
         print(f"Peer disconnected: {peer.peer_id}")
         if peer.peer_id in self.players:
             del self.players[peer.peer_id]
+            if self.remote_player and self.remote_player.player_id == peer.peer_id:
+                self.remote_player = None
         self.render()
 
     def _on_all_peers_connected(self):
@@ -219,35 +298,42 @@ class Game:
         state = {
             "player_id": self.local_player.player_id,
             "position": self.local_player.position,
-            "world_leds": list(self.world.lit_leds),
+            "health": self.local_player.health,
         }
-        # Schedule the async emit on the event loop (thread-safe for button callbacks)
         if self._loop is not None:
             self._loop.call_soon_threadsafe(
                 lambda: asyncio.create_task(self.mp._emit_to_all("game_state", state))
             )
 
+    def _broadcast_attack(self, target_position: int):
+        """Broadcast attack to all peers (thread-safe)."""
+        attack_data = {
+            "attacker_id": self.local_player.player_id,
+            "target_position": target_position,
+        }
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self.mp._emit_to_all("attack", attack_data))
+            )
+
     def render(self):
         """
         Render the current game state to the local board.
-        Shows:
-        - World LEDs that are toggled on (half brightness)
-        - Player positions (full brightness)
+        Shows player positions as lit LEDs.
         """
-        # Collect player positions for full brightness
-        player_positions = {player.position for player in self.players.values()}
+        if self.game_over:
+            return
 
-        # Render each LED in the world
+        # Turn off all world LEDs first
         for i in range(WORLD_SIZE):
-            if i in player_positions:
-                # Player position - full brightness
-                self.board.leds[i].on(brightness=1.0)
-            elif i in self.world.lit_leds:
-                # World LED toggled on - half brightness
-                self.board.leds[i].on(brightness=0.05)
-            else:
-                # LED is off
-                self.board.leds[i].off()
+            self.board.leds[i].off()
+
+        # Show local player position
+        self.board.leds[self.local_player.position].on()
+
+        # Show remote player position if exists
+        if self.remote_player:
+            self.board.leds[self.remote_player.position].on()
 
     async def start(self):
         """Start the game - connect to peers and begin game loop."""
@@ -261,6 +347,7 @@ class Game:
 
         print(f"Waiting for {NUM_PLAYERS - 1} other player(s)...")
         print(f"Local player spawned at position {self.local_player.position}")
+        print(f"Health: {self.local_player.health}")
 
         # Initial render - show our player while waiting
         self.render()
@@ -271,14 +358,21 @@ class Game:
         print("Game started!")
         print(f"Local player position: {self.local_player.position}")
         print("Controls:")
-        for btn, action in BUTTON_ACTIONS.items():
-            if action:
-                print(f"  Button {btn}: {action}")
+        print("  Button 0 (leftmost): Attack Left")
+        print("  Button 1: Move Left")
+        print("  Button 2: Move Right")
+        print("  Button 3 (rightmost): Attack Right")
+        print(f"\nHealth: {INITIAL_HEALTH} - Attack adjacent opponent to deal damage!")
 
         # Main game loop - keeps the game running
         try:
             while self.running:
-                await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
+                # Check for game over condition (opponent's health depleted)
+                if self.remote_player and not self.remote_player.is_alive():
+                    self._handle_game_over(winner=True)
+                    self.running = False
+                    break
+                await asyncio.sleep(0.1)
         except KeyboardInterrupt:
             await self.stop()
 

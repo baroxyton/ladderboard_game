@@ -1,4 +1,4 @@
-from api.BrightnessLed import BrightnessLed
+from .BrightnessLed import BrightnessLed
 
 
 class LadderboardLed:
