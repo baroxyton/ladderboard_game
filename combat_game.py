@@ -37,6 +37,15 @@ STATUS_FAIL_LED = 9    # Red status LED
 GREEN_LEDS = [4, 5]    # Main green LEDs for winner
 RED_LEDS = [0, 1]      # Main red LEDs for loser
 
+# Spawn positions for players (opposite sides)
+SPAWN_POSITIONS = [0, WORLD_SIZE - 1]  # Left side and right side
+
+# Countdown duration
+COUNTDOWN_SECONDS = 3
+
+# Time to wait before restart after game over
+RESTART_DELAY_SECONDS = 5
+
 
 # ============================================
 # GAME CLASSES
@@ -48,9 +57,7 @@ class Player:
 
     def __init__(self, player_id: str, position: int = None):
         self.player_id = player_id
-        self.position = (
-            position if position is not None else random.randint(0, WORLD_SIZE - 1)
-        )
+        self.position = position if position is not None else 0
         self.health = INITIAL_HEALTH
 
     def move_left(self):
@@ -94,8 +101,8 @@ class Game:
         self.game_over = False
         self._loop = None  # Store event loop reference for thread-safe callbacks
 
-        # Create local player with random starting position
-        self.local_player = Player(self.mp.peer_id)
+        # Create local player (position will be set when peer connects)
+        self.local_player = Player(self.mp.peer_id, position=0)
         self.players[self.mp.peer_id] = self.local_player
 
         # Setup button handlers
@@ -167,6 +174,7 @@ class Game:
             self._broadcast_attack(target_position)
             # Blink green status LED (dealt damage)
             self._schedule_blink(STATUS_OK_LED)
+            print(f"[ATTACK] You hit the opponent at position {target_position}!")
 
     def _schedule_blink(self, led_index: int):
         """Schedule an LED blink on the event loop."""
@@ -182,26 +190,26 @@ class Game:
         self.board.leds[led_index].off()
 
     async def _victory_animation(self):
-        """Play victory animation - alternating green LEDs."""
-        for _ in range(5):
+        """Play victory animation - blink all green LEDs for a few seconds."""
+        for _ in range(10):  # 10 blinks over ~4 seconds
             self.board.leds[GREEN_LEDS[0]].on()
-            self.board.leds[GREEN_LEDS[1]].off()
-            await asyncio.sleep(0.3)
-            self.board.leds[GREEN_LEDS[0]].off()
             self.board.leds[GREEN_LEDS[1]].on()
-            await asyncio.sleep(0.3)
-        self.board.leds[GREEN_LEDS[1]].off()
+            await asyncio.sleep(0.2)
+            self.board.leds[GREEN_LEDS[0]].off()
+            self.board.leds[GREEN_LEDS[1]].off()
+            await asyncio.sleep(0.2)
+        print("Victory! You won!")
 
     async def _defeat_animation(self):
-        """Play defeat animation - alternating red LEDs."""
-        for _ in range(5):
+        """Play defeat animation - blink all red LEDs for a few seconds."""
+        for _ in range(10):  # 10 blinks over ~4 seconds
             self.board.leds[RED_LEDS[0]].on()
-            self.board.leds[RED_LEDS[1]].off()
-            await asyncio.sleep(0.3)
-            self.board.leds[RED_LEDS[0]].off()
             self.board.leds[RED_LEDS[1]].on()
-            await asyncio.sleep(0.3)
-        self.board.leds[RED_LEDS[1]].off()
+            await asyncio.sleep(0.2)
+            self.board.leds[RED_LEDS[0]].off()
+            self.board.leds[RED_LEDS[1]].off()
+            await asyncio.sleep(0.2)
+        print("Defeat! You lost!")
 
     def _setup_network_handlers(self):
         """Setup handlers for network events."""
@@ -231,6 +239,8 @@ class Game:
                 self.players[player_id] = Player(player_id, position)
                 self.players[player_id].health = health
                 self.remote_player = self.players[player_id]
+                # Set deterministic spawn positions based on peer_id comparison
+                self._assign_spawn_positions()
             else:
                 self.players[player_id].position = position
                 self.players[player_id].health = health
@@ -247,6 +257,11 @@ class Game:
             self.local_player.take_damage()
             # Blink red status LED (took damage)
             self._schedule_blink(STATUS_FAIL_LED)
+            
+            # Debug print health status
+            print(f"[DAMAGE] You took damage! Your health: {self.local_player.health}/{INITIAL_HEALTH}")
+            if self.remote_player:
+                print(f"[DAMAGE] Opponent health: {self.remote_player.health}/{INITIAL_HEALTH}")
             
             # Broadcast updated state
             self._broadcast_state()
@@ -335,6 +350,45 @@ class Game:
         if self.remote_player:
             self.board.leds[self.remote_player.position].on()
 
+    async def _countdown(self):
+        """Display countdown before game starts."""
+        print("Get ready!")
+        for i in range(COUNTDOWN_SECONDS, 0, -1):
+            print(f"Starting in {i}...")
+            # Blink all LEDs during countdown
+            self.board.leds_on("ALL")
+            await asyncio.sleep(0.5)
+            self.board.leds_off("ALL")
+            await asyncio.sleep(0.5)
+        print("GO!")
+
+    def _assign_spawn_positions(self):
+        """
+        Assign spawn positions based on peer_id comparison.
+        The player with the 'smaller' peer_id gets position 0 (left),
+        the other gets position 7 (right). This ensures both clients
+        see the same board state.
+        """
+        if self.remote_player is None:
+            return
+        
+        if self.local_player.player_id < self.remote_player.player_id:
+            self.local_player.position = SPAWN_POSITIONS[0]  # Left
+            self.remote_player.position = SPAWN_POSITIONS[1]  # Right
+        else:
+            self.local_player.position = SPAWN_POSITIONS[1]  # Right
+            self.remote_player.position = SPAWN_POSITIONS[0]  # Left
+
+    def _reset_game(self):
+        """Reset game state for a new round."""
+        self.game_over = False
+        self.local_player.health = INITIAL_HEALTH
+        if self.remote_player:
+            self.remote_player.health = INITIAL_HEALTH
+        # Re-assign spawn positions (deterministic based on peer_id)
+        self._assign_spawn_positions()
+        self.board.leds_off("ALL")
+
     async def start(self):
         """Start the game - connect to peers and begin game loop."""
         self.running = True
@@ -355,26 +409,45 @@ class Game:
         # Seek other players
         await self.mp.seek_peers(NUM_PLAYERS - 1)
 
-        print("Game started!")
-        print(f"Local player position: {self.local_player.position}")
-        print("Controls:")
-        print("  Button 0 (leftmost): Attack Left")
-        print("  Button 1: Move Left")
-        print("  Button 2: Move Right")
-        print("  Button 3 (rightmost): Attack Right")
-        print(f"\nHealth: {INITIAL_HEALTH} - Attack adjacent opponent to deal damage!")
+        # Game loop with restart capability
+        while self.running:
+            # Countdown before game starts
+            await self._countdown()
 
-        # Main game loop - keeps the game running
-        try:
-            while self.running:
-                # Check for game over condition (opponent's health depleted)
-                if self.remote_player and not self.remote_player.is_alive():
-                    self._handle_game_over(winner=True)
-                    self.running = False
-                    break
-                await asyncio.sleep(0.1)
-        except KeyboardInterrupt:
-            await self.stop()
+            print("Game started!")
+            print(f"Local player position: {self.local_player.position}")
+            print("Controls:")
+            print("  Button 0 (leftmost): Attack Left")
+            print("  Button 1: Move Left")
+            print("  Button 2: Move Right")
+            print("  Button 3 (rightmost): Attack Right")
+            print(f"\nHealth: {INITIAL_HEALTH} - Attack adjacent opponent to deal damage!")
+
+            # Broadcast initial state and render
+            self._broadcast_state()
+            self.render()
+
+            # Main game loop - keeps the game running until game over
+            try:
+                while self.running and not self.game_over:
+                    # Check for game over condition (opponent's health depleted)
+                    if self.remote_player and not self.remote_player.is_alive():
+                        self._handle_game_over(winner=True)
+                        break
+                    await asyncio.sleep(0.1)
+                
+                # If game ended, wait for restart
+                if self.game_over and self.running:
+                    print(f"\nRestarting in {RESTART_DELAY_SECONDS} seconds...")
+                    await asyncio.sleep(RESTART_DELAY_SECONDS)
+                    self._reset_game()
+                    print("\n" + "="*40)
+                    print("NEW ROUND!")
+                    print("="*40 + "\n")
+                    
+            except KeyboardInterrupt:
+                await self.stop()
+                break
 
     async def stop(self):
         """Stop the game and clean up."""
