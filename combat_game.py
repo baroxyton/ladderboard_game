@@ -102,8 +102,10 @@ class Game:
         self.remote_player = None  # Reference to the opponent
         self.running = False
         self.game_over = False
+        self.game_started = False  # Track if game has started (after countdown)
         self._loop = None  # Store event loop reference for thread-safe callbacks
         self._last_attack_time = 0  # Track last attack time for cooldown
+        self._loading = False  # Track if loading animation is running
 
         # Create local player (position will be set when peer connects)
         self.local_player = Player(self.mp.peer_id, position=0)
@@ -133,7 +135,7 @@ class Game:
 
         if action == "move_left":
             def handler(self=self):
-                if self.game_over:
+                if self.game_over or not self.game_started:
                     return
                 self.local_player.move_left()
                 self._broadcast_state()
@@ -142,7 +144,7 @@ class Game:
 
         elif action == "move_right":
             def handler(self=self):
-                if self.game_over:
+                if self.game_over or not self.game_started:
                     return
                 self.local_player.move_right()
                 self._broadcast_state()
@@ -151,14 +153,14 @@ class Game:
 
         elif action == "attack_left":
             def handler(self=self):
-                if self.game_over:
+                if self.game_over or not self.game_started:
                     return
                 self._attack_direction(-1)
             button.on_press(handler)
 
         elif action == "attack_right":
             def handler(self=self):
-                if self.game_over:
+                if self.game_over or not self.game_started:
                     return
                 self._attack_direction(1)
             button.on_press(handler)
@@ -362,16 +364,63 @@ class Game:
         if self.remote_player:
             self.board.leds[self.remote_player.position].on()
 
+    async def _loading_animation(self):
+        """Display loading animation while waiting for opponent."""
+        self._loading = True
+        led_index = 0
+        
+        while self._loading:
+            # Turn off all world LEDs
+            for i in range(WORLD_SIZE):
+                self.board.leds[i].off()
+            
+            # Light up current LED
+            self.board.leds[led_index].on()
+            
+            # Move to next LED
+            led_index = (led_index + 1) % WORLD_SIZE
+            
+            await asyncio.sleep(0.1)
+        
+        # Turn off all LEDs when done
+        self.board.leds_off("ALL")
+
+    def _stop_loading(self):
+        """Stop the loading animation."""
+        self._loading = False
+
     async def _countdown(self):
-        """Display countdown before game starts."""
+        """Display countdown sequence before game starts."""
         print("Get ready!")
-        for i in range(COUNTDOWN_SECONDS, 0, -1):
-            print(f"Starting in {i}...")
-            # Blink all LEDs during countdown
-            self.board.leds_on("ALL")
-            await asyncio.sleep(0.5)
-            self.board.leds_off("ALL")
-            await asyncio.sleep(0.5)
+        
+        # Step 1: All 8 world LEDs on for 2 seconds
+        for i in range(WORLD_SIZE):
+            self.board.leds[i].on()
+        await asyncio.sleep(2)
+        
+        # Step 2: Only green LEDs for 1 second
+        for i in range(WORLD_SIZE):
+            self.board.leds[i].off()
+        for led_idx in GREEN_LEDS:
+            self.board.leds[led_idx].on()
+        await asyncio.sleep(1)
+        
+        # Step 3: Only yellow LEDs for 1 second
+        for led_idx in GREEN_LEDS:
+            self.board.leds[led_idx].off()
+        for led_idx in [2, 3]:  # Yellow LEDs
+            self.board.leds[led_idx].on()
+        await asyncio.sleep(1)
+        
+        # Step 4: Only red LEDs for 1 second
+        for i in [2, 3]:
+            self.board.leds[i].off()
+        for led_idx in RED_LEDS:
+            self.board.leds[led_idx].on()
+        await asyncio.sleep(1)
+        
+        # Clear all LEDs
+        self.board.leds_off("ALL")
         print("GO!")
 
     def _assign_spawn_positions(self):
@@ -394,6 +443,7 @@ class Game:
     def _reset_game(self):
         """Reset game state for a new round."""
         self.game_over = False
+        self.game_started = False
         self.local_player.health = INITIAL_HEALTH
         if self.remote_player:
             self.remote_player.health = INITIAL_HEALTH
@@ -414,20 +464,28 @@ class Game:
         await self.mp.start_server()
 
         print(f"Waiting for {NUM_PLAYERS - 1} other player(s)...")
-        print(f"Local player spawned at position {self.local_player.position}")
-        print(f"Health: {self.local_player.health}")
 
-        # Initial render - show our player while waiting
-        self.render()
+        # Start loading animation in the background
+        loading_task = asyncio.create_task(self._loading_animation())
 
         # Seek other players
         await self.mp.seek_peers(NUM_PLAYERS - 1)
 
+        # Stop loading animation
+        self._stop_loading()
+        await loading_task  # Wait for animation to finish cleanly
+
         # Game loop with restart capability
         while self.running:
+            # Assign spawn positions now that both players are connected
+            self._assign_spawn_positions()
+            
             # Countdown before game starts
             await self._countdown()
 
+            # Game has now started - enable controls
+            self.game_started = True
+            
             print("Game started!")
             print(f"Local player position: {self.local_player.position}")
             print("Controls:")
