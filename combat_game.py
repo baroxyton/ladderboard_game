@@ -338,6 +338,11 @@ class Game:
             del self.players[peer.peer_id]
             if self.remote_player and self.remote_player.player_id == peer.peer_id:
                 self.remote_player = None
+                # End current game immediately if in progress
+                if self.game_started and not self.game_over:
+                    print("Opponent disconnected during game. Ending round...")
+                    self.game_over = True
+                    self.game_started = False
         self.render()
 
     def _on_all_peers_connected(self):
@@ -412,6 +417,24 @@ class Game:
     def _stop_loading(self):
         """Stop the loading animation."""
         self._loading = False
+
+    async def _wait_for_opponent(self):
+        """Wait for an opponent to connect, showing loading animation."""
+        if self.remote_player is not None:
+            return  # Already have opponent
+        
+        print("Waiting for opponent...")
+        loading_task = asyncio.create_task(self._loading_animation())
+        
+        try:
+            # Keep seeking until we have an opponent
+            while self.running and self.remote_player is None:
+                await self.mp.seek_peers(NUM_PLAYERS - 1)
+                if self.remote_player is None:
+                    await asyncio.sleep(0.5)  # Brief pause before retry
+        finally:
+            self._stop_loading()
+            await loading_task
 
     async def _countdown(self):
         """Display countdown sequence before game starts."""
@@ -516,23 +539,21 @@ class Game:
         # Start multiplayer server
         await self.mp.start_server()
 
-        print(f"Waiting for {NUM_PLAYERS - 1} other player(s)...")
-
-        # Start loading animation in the background
-        loading_task = asyncio.create_task(self._loading_animation())
-
-        # Seek other players
-        await self.mp.seek_peers(NUM_PLAYERS - 1)
-
-        # Stop loading animation
-        self._stop_loading()
-        await loading_task  # Wait for animation to finish cleanly
-
+        # Wait for initial opponent connection
+        await self._wait_for_opponent()
+        
         # Determine host now that we know peers
         self._determine_host()
 
         # Game loop with restart capability
         while self.running:
+            # Check if we need to wait for opponent (after disconnect or initial)
+            if self.remote_player is None:
+                await self._wait_for_opponent()
+                if self.remote_player is None:
+                    continue  # Still no opponent, retry
+                self._determine_host()
+            
             # Fresh event for this round
             self._round_start_event = asyncio.Event()
 
@@ -545,6 +566,10 @@ class Game:
 
             # Wait for start signal then run the shared countdown
             await self._round_start_event.wait()
+            
+            # Check if opponent disconnected while waiting
+            if self.remote_player is None:
+                continue
 
             # Countdown before game starts
             await self._countdown()
@@ -568,20 +593,29 @@ class Game:
             # Main game loop - keeps the game running until game over
             try:
                 while self.running and not self.game_over:
+                    # Check for opponent disconnect
+                    if self.remote_player is None:
+                        print("Opponent disconnected!")
+                        break
+                    
                     # Check for game over condition (opponent's health depleted)
-                    if self.remote_player and not self.remote_player.is_alive():
+                    if not self.remote_player.is_alive():
                         self._handle_game_over(winner=True)
                         break
                     await asyncio.sleep(0.1)
                 
-                # If game ended, wait for restart
-                if self.game_over and self.running:
+                # If game ended normally (not disconnect), wait for restart
+                if self.game_over and self.running and self.remote_player is not None:
                     print(f"\nRestarting in {RESTART_DELAY_SECONDS} seconds...")
                     await asyncio.sleep(RESTART_DELAY_SECONDS)
                     self._reset_game()
                     print("\n" + "="*40)
                     print("NEW ROUND!")
                     print("="*40 + "\n")
+                elif self.remote_player is None:
+                    # Opponent disconnected - reset and go back to waiting
+                    self._reset_game()
+                    print("\nSearching for new opponent...\n")
                     
             except KeyboardInterrupt:
                 await self.stop()
