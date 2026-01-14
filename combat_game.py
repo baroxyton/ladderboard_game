@@ -338,6 +338,12 @@ class Game:
             del self.players[peer.peer_id]
             if self.remote_player and self.remote_player.player_id == peer.peer_id:
                 self.remote_player = None
+        # Mark game to restart and block controls
+        self.game_started = False
+        self.game_over = True
+        # Unblock any waiters so loops can continue
+        if self._round_start_event:
+            self._round_start_event.set()
         self.render()
 
     def _on_all_peers_connected(self):
@@ -412,6 +418,25 @@ class Game:
     def _stop_loading(self):
         """Stop the loading animation."""
         self._loading = False
+
+    async def _wait_for_peer(self):
+        """Wait until a peer is connected, showing loading animation and re-seeking as needed."""
+        # If already connected, nothing to do
+        if self.remote_player is not None:
+            return
+
+        # Start loading animation
+        self._loading = True
+        loading_task = asyncio.create_task(self._loading_animation())
+
+        try:
+            while self.running and self.remote_player is None:
+                await self.mp.seek_peers(NUM_PLAYERS - 1)
+                if self.remote_player is None:
+                    await asyncio.sleep(0.5)
+        finally:
+            self._stop_loading()
+            await loading_task
 
     async def _countdown(self):
         """Display countdown sequence before game starts."""
@@ -518,23 +543,23 @@ class Game:
 
         print(f"Waiting for {NUM_PLAYERS - 1} other player(s)...")
 
-        # Start loading animation in the background
-        loading_task = asyncio.create_task(self._loading_animation())
-
-        # Seek other players
-        await self.mp.seek_peers(NUM_PLAYERS - 1)
-
-        # Stop loading animation
-        self._stop_loading()
-        await loading_task  # Wait for animation to finish cleanly
+# Wait until a peer is connected (shows loading animation internally)
+        await self._wait_for_peer()
 
         # Determine host now that we know peers
         self._determine_host()
-
+ 
         # Game loop with restart capability
         while self.running:
             # Fresh event for this round
             self._round_start_event = asyncio.Event()
+
+            # If we lost the peer, go back to waiting
+            if self.remote_player is None:
+                await self._wait_for_peer()
+                if self.remote_player is None:
+                    continue
+                self._determine_host()
 
             # Assign spawn positions now that both players are connected
             self._assign_spawn_positions()
@@ -545,6 +570,10 @@ class Game:
 
             # Wait for start signal then run the shared countdown
             await self._round_start_event.wait()
+
+            # If peer disconnected while waiting, loop back
+            if self.remote_player is None:
+                continue
 
             # Countdown before game starts
             await self._countdown()
@@ -567,14 +596,14 @@ class Game:
 
             # Main game loop - keeps the game running until game over
             try:
-                while self.running and not self.game_over:
+                while self.running and not self.game_over and self.remote_player is not None:
                     # Check for game over condition (opponent's health depleted)
                     if self.remote_player and not self.remote_player.is_alive():
                         self._handle_game_over(winner=True)
                         break
                     await asyncio.sleep(0.1)
                 
-                # If game ended, wait for restart
+                # If game ended or peer disconnected, wait for restart/seek
                 if self.game_over and self.running:
                     print(f"\nRestarting in {RESTART_DELAY_SECONDS} seconds...")
                     await asyncio.sleep(RESTART_DELAY_SECONDS)
