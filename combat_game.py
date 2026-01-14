@@ -104,7 +104,7 @@ class Game:
         self.game_over = False
         self.game_started = False  # Track if game has started (after countdown)
         self._loop = None  # Store event loop reference for thread-safe callbacks
-        self._last_attack_time = 0  # Track last attack time for cooldown
+        self._attack_cooldown_end = 0  # Track when attack cooldown ends
         self._loading = False  # Track if loading animation is running
 
         # Create local player (position will be set when peer connects)
@@ -169,22 +169,27 @@ class Game:
         """
         Attack in a direction (-1 for left, +1 for right).
         If opponent is on the adjacent cell, deal damage.
+        Pressing the button activates a cooldown period during which no attacks can occur.
         """
         import time
         
         if self.remote_player is None:
             return
 
-        # Check cooldown
         current_time = time.time()
-        if current_time - self._last_attack_time < ATTACK_COOLDOWN:
-            return  # Still on cooldown
         
+        # Check if still in cooldown from a previous button press
+        if current_time < self._attack_cooldown_end:
+            return  # Still on cooldown, ignore this press
+        
+        # Set cooldown - any button press now starts the cooldown
+        self._attack_cooldown_end = current_time + ATTACK_COOLDOWN
+        
+        # Check if target is on adjacent position
         target_position = (self.local_player.position + direction) % WORLD_SIZE
 
         if self.remote_player.position == target_position:
             # Hit the opponent!
-            self._last_attack_time = current_time  # Update cooldown timer
             self._broadcast_attack(target_position)
             # Blink green status LED (dealt damage)
             self._schedule_blink(STATUS_OK_LED)
@@ -450,7 +455,7 @@ class Game:
         # Re-assign spawn positions (deterministic based on peer_id)
         self._assign_spawn_positions()
         # Reset attack cooldown
-        self._last_attack_time = 0
+        self._attack_cooldown_end = 0
         self.board.leds_off("ALL")
 
     async def start(self):
