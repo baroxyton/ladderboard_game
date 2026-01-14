@@ -47,7 +47,7 @@ COUNTDOWN_SECONDS = 3
 RESTART_DELAY_SECONDS = 5
 
 # Attack cooldown in seconds (prevents spam-clicking)
-ATTACK_COOLDOWN = 0.5
+ATTACK_COOLDOWN = 1
 
 
 # ============================================
@@ -104,8 +104,10 @@ class Game:
         self.game_over = False
         self.game_started = False  # Track if game has started (after countdown)
         self._loop = None  # Store event loop reference for thread-safe callbacks
-        self._attack_cooldown_end = 0  # Track when attack cooldown ends
+        self._last_attack_press_time = 0  # Track last valid attack button press
         self._loading = False  # Track if loading animation is running
+        self._is_host = False  # Determines which peer coordinates round start
+        self._round_start_event = asyncio.Event()  # Sync start between peers
 
         # Create local player (position will be set when peer connects)
         self.local_player = Player(self.mp.peer_id, position=0)
@@ -137,7 +139,7 @@ class Game:
             def handler(self=self):
                 if self.game_over or not self.game_started:
                     return
-                self.local_player.move_left()
+                self._move_with_skip(-1)
                 self._broadcast_state()
                 self.render()
             button.on_press(handler)
@@ -146,7 +148,7 @@ class Game:
             def handler(self=self):
                 if self.game_over or not self.game_started:
                     return
-                self.local_player.move_right()
+                self._move_with_skip(1)
                 self._broadcast_state()
                 self.render()
             button.on_press(handler)
@@ -178,12 +180,12 @@ class Game:
 
         current_time = time.time()
         
-        # Check if still in cooldown from a previous button press
-        if current_time < self._attack_cooldown_end:
-            return  # Still on cooldown, ignore this press
+        # Minecraft-style: attack only if button hasn't been pressed within cooldown window
+        if current_time - self._last_attack_press_time < ATTACK_COOLDOWN:
+            return  # Too soon since last press
         
-        # Set cooldown - any button press now starts the cooldown
-        self._attack_cooldown_end = current_time + ATTACK_COOLDOWN
+        # Record this valid press time
+        self._last_attack_press_time = current_time
         
         # Check if target is on adjacent position
         target_position = (self.local_player.position + direction) % WORLD_SIZE
@@ -192,7 +194,7 @@ class Game:
             # Hit the opponent!
             self._broadcast_attack(target_position)
             # Blink green status LED (dealt damage)
-            self._schedule_blink(STATUS_OK_LED)
+            self._blink_status_hit()
             print(f"[ATTACK] You hit the opponent at position {target_position}!")
 
     def _schedule_blink(self, led_index: int):
@@ -201,6 +203,14 @@ class Game:
             self._loop.call_soon_threadsafe(
                 lambda: asyncio.create_task(self._blink_led(led_index))
             )
+
+    def _blink_status_hit(self):
+        """Blink status LED when dealing damage (swap mapping)."""
+        self._schedule_blink(STATUS_FAIL_LED)
+
+    def _blink_status_hurt(self):
+        """Blink status LED when taking damage (swap mapping)."""
+        self._schedule_blink(STATUS_OK_LED)
 
     async def _blink_led(self, led_index: int):
         """Blink a single LED once."""
@@ -238,6 +248,9 @@ class Game:
         # Handle attack events
         self.mp.on("attack", self._on_attack)
 
+        # Handle round start sync
+        self.mp.on("start_round", self._on_start_round)
+
         # Handle new peer connections
         self.mp.on("peer_connected", self._on_peer_connected)
 
@@ -260,6 +273,7 @@ class Game:
                 self.remote_player = self.players[player_id]
                 # Set deterministic spawn positions based on peer_id comparison
                 self._assign_spawn_positions()
+                self._determine_host()
             else:
                 self.players[player_id].position = position
                 self.players[player_id].health = health
@@ -275,7 +289,7 @@ class Game:
         if self.local_player.position == target_position:
             self.local_player.take_damage()
             # Blink red status LED (took damage)
-            self._schedule_blink(STATUS_FAIL_LED)
+            self._blink_status_hurt()
             
             # Debug print health status
             print(f"[DAMAGE] You took damage! Your health: {self.local_player.health}/{INITIAL_HEALTH}")
@@ -290,6 +304,11 @@ class Game:
                 self._handle_game_over(winner=False)
         
         self.render()
+
+    def _on_start_round(self, *_args, **_kwargs):
+        """Handle round start sync signal."""
+        if self._round_start_event:
+            self._round_start_event.set()
 
     def _handle_game_over(self, winner: bool):
         """Handle end of game."""
@@ -445,6 +464,35 @@ class Game:
             self.local_player.position = SPAWN_POSITIONS[1]  # Right
             self.remote_player.position = SPAWN_POSITIONS[0]  # Left
 
+    def _determine_host(self):
+        """Decide which peer coordinates round starts (smallest peer_id)."""
+        if self.remote_player is None:
+            self._is_host = True
+            return
+        self._is_host = self.local_player.player_id < self.remote_player.player_id
+
+    def _signal_round_start(self):
+        """Host signals round start to peers and itself."""
+        if self._round_start_event:
+            self._round_start_event.set()
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self.mp._emit_to_all("start_round", {}))
+            )
+
+    def _move_with_skip(self, direction: int):
+        """Move player; if target occupied by opponent, jump over to next cell."""
+        if self.remote_player is None:
+            # Normal move if no opponent yet
+            self.local_player.position = (self.local_player.position + direction) % WORLD_SIZE
+            return
+
+        target = (self.local_player.position + direction) % WORLD_SIZE
+        if target == self.remote_player.position:
+            # Jump over opponent to the next cell in same direction
+            target = (target + direction) % WORLD_SIZE
+        self.local_player.position = target
+
     def _reset_game(self):
         """Reset game state for a new round."""
         self.game_over = False
@@ -455,7 +503,7 @@ class Game:
         # Re-assign spawn positions (deterministic based on peer_id)
         self._assign_spawn_positions()
         # Reset attack cooldown
-        self._attack_cooldown_end = 0
+        self._last_attack_press_time = 0
         self.board.leds_off("ALL")
 
     async def start(self):
@@ -480,11 +528,24 @@ class Game:
         self._stop_loading()
         await loading_task  # Wait for animation to finish cleanly
 
+        # Determine host now that we know peers
+        self._determine_host()
+
         # Game loop with restart capability
         while self.running:
+            # Fresh event for this round
+            self._round_start_event = asyncio.Event()
+
             # Assign spawn positions now that both players are connected
             self._assign_spawn_positions()
             
+            # Host signals start; others wait for the signal
+            if self._is_host:
+                self._signal_round_start()
+
+            # Wait for start signal then run the shared countdown
+            await self._round_start_event.wait()
+
             # Countdown before game starts
             await self._countdown()
 
