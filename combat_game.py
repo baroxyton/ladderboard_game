@@ -554,11 +554,12 @@ class Game:
                     continue  # Still no opponent, retry
                 self._determine_host()
             
-            # Fresh event for this round
-            self._round_start_event = asyncio.Event()
-
             # Assign spawn positions now that both players are connected
             self._assign_spawn_positions()
+            
+            # Fresh event for this round - MUST be created BEFORE host signals
+            # to avoid race condition where signal arrives before event is created
+            self._round_start_event = asyncio.Event()
             
             # Host signals start; others wait for the signal
             if self._is_host:
