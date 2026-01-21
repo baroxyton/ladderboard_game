@@ -108,6 +108,7 @@ class Game:
         self._loading = False  # Track if loading animation is running
         self._is_host = False  # Determines which peer coordinates round start
         self._round_start_event = asyncio.Event()  # Sync start between peers
+        self._current_round = 0  # Track current round number to prevent cross-round signals
 
         # Create local player (position will be set when peer connects)
         self.local_player = Player(self.mp.peer_id, position=0)
@@ -305,9 +306,11 @@ class Game:
         
         self.render()
 
-    def _on_start_round(self, *_args, **_kwargs):
+    def _on_start_round(self, peer, data: dict):
         """Handle round start sync signal."""
-        if self._round_start_event:
+        round_num = data.get("round_num", 0)
+        # Only set event if this message is for the current round
+        if round_num == self._current_round and self._round_start_event:
             self._round_start_event.set()
 
     def _handle_game_over(self, winner: bool):
@@ -499,8 +502,9 @@ class Game:
         if self._round_start_event:
             self._round_start_event.set()
         if self._loop is not None:
+            round_data = {"round_num": self._current_round}
             self._loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(self.mp._emit_to_all("start_round", {}))
+                lambda: asyncio.create_task(self.mp._emit_to_all("start_round", round_data))
             )
 
     def _move_with_skip(self, direction: int):
@@ -527,6 +531,8 @@ class Game:
         self._assign_spawn_positions()
         # Reset attack cooldown
         self._last_attack_press_time = 0
+        # Increment round counter to invalidate any pending signals from previous round
+        self._current_round += 1
         self.board.leds_off("ALL")
 
     async def start(self):
